@@ -43,7 +43,17 @@ var (
 	AnalysisOutputMountPath   = path.Join(OutputPath, "output.yaml")
 	DepsOutputMountPath       = path.Join(OutputPath, "dependencies.yaml")
 	ProviderSettingsMountPath = path.Join(ConfigMountPath, "settings.json")
+	// Maximum input count, TODO allow adjust with env
+	InputMax = 10
 )
+
+type inputApplication struct {
+	shortName string
+	input string
+	isFileInput bool
+	sourceMountPath string //??
+	//result dir and shared static
+}
 
 // kantra analyze flags
 type analyzeCommand struct {
@@ -57,7 +67,7 @@ type analyzeCommand struct {
 	sources               []string
 	targets               []string
 	labelSelector         string
-	input                 string
+	input                 []string	// used for passing a CLI --input args
 	output                string
 	mode                  string
 	rules                 []string
@@ -71,9 +81,10 @@ type analyzeCommand struct {
 	tempDirs []string
 	log      logr.Logger
 	// isFileInput is set when input points to a file and not a dir
-	isFileInput bool
+	//isFileInput []bool
 	logLevel    *uint32
 	cleanup     bool
+	inputApplications []inputApplication
 }
 
 // analyzeCmd represents the analyze command
@@ -123,15 +134,17 @@ func NewAnalyzeCmd(log logr.Logger) *cobra.Command {
 				log.Error(err, "failed to convert xml rules")
 				return err
 			}
-			err = analyzeCmd.RunAnalysis(cmd.Context(), xmlOutputDir)
-			if err != nil {
-				log.Error(err, "failed to run analysis")
-				return err
-			}
-			err = analyzeCmd.CreateJSONOutput()
-			if err != nil {
-				log.Error(err, "failed to create json output file")
-				return err
+			for _, app := range analyzeCmd.inputApplications {
+				err = analyzeCmd.RunAnalysis(cmd.Context(), app, xmlOutputDir)
+				if err != nil {
+					log.Error(err, "failed to run analysis")
+					return err
+				}
+				err = analyzeCmd.CreateJSONOutput()
+				if err != nil {
+					log.Error(err, "failed to create json output file")
+					return err
+				}
 			}
 			err = analyzeCmd.GenerateStaticReport(cmd.Context())
 			if err != nil {
@@ -155,7 +168,7 @@ func NewAnalyzeCmd(log logr.Logger) *cobra.Command {
 	analyzeCommand.Flags().StringArrayVarP(&analyzeCmd.targets, "target", "t", []string{}, "target technology to consider for analysis. Use multiple times for additional targets: --target <target1> --target <target2> ...")
 	analyzeCommand.Flags().StringVarP(&analyzeCmd.labelSelector, "label-selector", "l", "", "run rules based on specified label selector expression")
 	analyzeCommand.Flags().StringArrayVar(&analyzeCmd.rules, "rules", []string{}, "filename or directory containing rule files. Use multiple times for additional rules: --rules <rule1> --rules <rule2> ...")
-	analyzeCommand.Flags().StringVarP(&analyzeCmd.input, "input", "i", "", "path to application source code or a binary")
+	analyzeCommand.Flags().StringArrayVarP(&analyzeCmd.input, "input", "i", []string{}, "path to application source code or a binary. Use multiple times for multiple applications analysis.")
 	analyzeCommand.Flags().StringVarP(&analyzeCmd.output, "output", "o", "", "path to the directory for analysis output")
 	analyzeCommand.Flags().BoolVar(&analyzeCmd.skipStaticReport, "skip-static-report", false, "do not generate static report")
 	analyzeCommand.Flags().BoolVar(&analyzeCmd.analyzeKnownLibraries, "analyze-known-libraries", false, "analyze known open-source libraries")
@@ -184,10 +197,10 @@ func (a *analyzeCommand) Validate() error {
 	for _, arg := range os.Args {
 		if arg == "-i" || strings.Contains(arg, "--input") {
 			inputNum += 1
-			if inputNum > 1 {
-				return fmt.Errorf("must specify only one input source")
-			}
 		}
+	}
+	if inputNum > InputMax {
+		return fmt.Errorf("must specify only one input source")
 	}
 	err := a.CheckOverwriteOutput()
 	if err != nil {
@@ -207,20 +220,32 @@ func (a *analyzeCommand) Validate() error {
 	if stat != nil && !stat.IsDir() {
 		return fmt.Errorf("output path %s is not a directory", a.output)
 	}
-	stat, err = os.Stat(a.input)
-	if err != nil {
-		return fmt.Errorf("%w failed to stat input path %s", err, a.input)
-	}
-	// when input isn't a dir, it's pointing to a binary
-	// we need abs path to mount the file correctly
-	if !stat.Mode().IsDir() {
-		a.input, err = filepath.Abs(a.input)
+	// Prepare all Applications input
+	for i := range a.input {
+		app := inputApplication{input: a.input[i]}
+		stat, err = os.Stat(app.input)
 		if err != nil {
-			return fmt.Errorf("%w failed to get absolute path for input file %s", err, a.input)
+			return fmt.Errorf("%w failed to stat input path %s", err, app.input)
 		}
-		// make sure we mount a file and not a dir
-		SourceMountPath = path.Join(SourceMountPath, filepath.Base(a.input))
-		a.isFileInput = true
+		// when input isn't a dir, it's pointing to a binary
+		// we need abs path to mount the file correctly
+		if !stat.Mode().IsDir() {
+			app.input, err = filepath.Abs(app.input)
+			if err != nil {
+				return fmt.Errorf("%w failed to get absolute path for input file %s", err, app.input)
+			}
+			// make sure we mount a file and not a dir
+			app.sourceMountPath = path.Join(SourceMountPath, filepath.Base(app.input)) // modify for multiple ount points for multiple pods
+			app.isFileInput = true                                                 // TODO: initiate somewhere to input len?
+		}
+		// try to get abs path, if not, continue with relative path
+		if absPath, err := filepath.Abs(a.output); err == nil {
+			a.output = absPath
+		}
+		if absPath, err := filepath.Abs(app.input); err == nil {
+			app.input = absPath
+		}
+		a.inputApplications = append(a.inputApplications, app)
 	}
 	if a.mode != string(provider.FullAnalysisMode) &&
 		a.mode != string(provider.SourceOnlyAnalysisMode) {
@@ -228,13 +253,6 @@ func (a *analyzeCommand) Validate() error {
 	}
 	if _, err := os.Stat(a.mavenSettingsFile); a.mavenSettingsFile != "" && err != nil {
 		return fmt.Errorf("%w failed to stat maven settings file at path %s", err, a.mavenSettingsFile)
-	}
-	// try to get abs path, if not, continue with relative path
-	if absPath, err := filepath.Abs(a.output); err == nil {
-		a.output = absPath
-	}
-	if absPath, err := filepath.Abs(a.input); err == nil {
-		a.input = absPath
 	}
 	if absPath, err := filepath.Abs(a.mavenSettingsFile); a.mavenSettingsFile != "" && err == nil {
 		a.mavenSettingsFile = absPath
@@ -401,7 +419,7 @@ func listOptionsFromLabels(sl []string, label string) {
 	}
 }
 
-func (a *analyzeCommand) getConfigVolumes() (map[string]string, error) {
+func (a *analyzeCommand) getConfigVolumes(app inputApplication) (map[string]string, error) {
 	tempDir, err := os.MkdirTemp("", "analyze-config-")
 	if err != nil {
 		a.log.V(1).Error(err, "failed creating temp dir", "dir", tempDir)
@@ -410,11 +428,11 @@ func (a *analyzeCommand) getConfigVolumes() (map[string]string, error) {
 	a.log.V(1).Info("created directory for provider settings", "dir", tempDir)
 	a.tempDirs = append(a.tempDirs, tempDir)
 
-	otherProvsMountPath := SourceMountPath
+	otherProvsMountPath := app.sourceMountPath
 	// when input is a file, it means it's probably a binary
 	// only java provider can work with binaries, all others
 	// continue pointing to the directory instead of file
-	if a.isFileInput {
+	if app.isFileInput {
 		otherProvsMountPath = path.Dir(otherProvsMountPath)
 	}
 
@@ -662,10 +680,10 @@ func (a analyzeCommand) createTempRuleSet(path string, name string) error {
 	return nil
 }
 
-func (a *analyzeCommand) RunAnalysis(ctx context.Context, xmlOutputDir string) error {
+func (a *analyzeCommand) RunAnalysis(ctx context.Context, app inputApplication, xmlOutputDir string) error {
 	volumes := map[string]string{
 		// application source code
-		a.input: SourceMountPath,
+		"input": app.sourceMountPath,
 		// output directory
 		a.output: OutputPath,
 	}
@@ -681,7 +699,7 @@ func (a *analyzeCommand) RunAnalysis(ctx context.Context, xmlOutputDir string) e
 		a.tempDirs = append(a.tempDirs, xmlOutputDir)
 	}
 
-	configVols, err := a.getConfigVolumes()
+	configVols, err := a.getConfigVolumes(app)
 	if err != nil {
 		a.log.V(1).Error(err, "failed to get config volumes for analysis")
 		return err
@@ -742,7 +760,7 @@ func (a *analyzeCommand) RunAnalysis(ctx context.Context, xmlOutputDir string) e
 	defer analysisLog.Close()
 
 	a.log.Info("running source code analysis", "log", analysisLogFilePath,
-		"input", a.input, "output", a.output, "args", strings.Join(args, " "), "volumes", volumes)
+		"input", app.sourceMountPath, "output", a.output, "args", strings.Join(args, " "), "volumes", volumes)
 	a.log.Info("generating analysis log in file", "file", analysisLogFilePath)
 	// TODO (pgaikwad): run analysis & deps in parallel
 	err = container.NewContainer().Run(
@@ -823,21 +841,26 @@ func (a *analyzeCommand) GenerateStaticReport(ctx context.Context) error {
 		return nil
 	}
 	volumes := map[string]string{
-		a.input:  SourceMountPath,
+		"input":  SourceMountPath,	// TODO multiple apps
 		a.output: OutputPath,
 	}
 	args := []string{}
-	staticReportArgs := []string{"/usr/local/bin/js-bundle-generator",
+	staticReportArgs := []string{
+		"/usr/local/bin/js-bundle-generator",
 		fmt.Sprintf("--analysis-output-list=%s", AnalysisOutputMountPath),
 		fmt.Sprintf("--output-path=%s", path.Join("/usr/local/static-report/output.js")),
-		fmt.Sprintf("--application-name-list=%s", filepath.Base(a.input)),
+	}
+	for _, app := range a.inputApplications {
+		staticReportArgs = append(staticReportArgs, fmt.Sprintf("--application-name-list=%s", filepath.Base(app.sourceMountPath)))
 	}
 	if a.mode == string(provider.FullAnalysisMode) {
 		staticReportArgs = append(staticReportArgs,
 			fmt.Sprintf("--deps-output-list=%s", DepsOutputMountPath))
 	}
-	cpArgs := []string{"&& cp -r",
-		"/usr/local/static-report", OutputPath}
+	cpArgs := []string{
+		"&& cp -r",
+		"/usr/local/static-report", OutputPath,
+	}
 
 	args = append(args, staticReportArgs...)
 	args = append(args, cpArgs...)
