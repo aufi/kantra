@@ -43,6 +43,8 @@ var (
 	AnalysisOutputMountPath   = path.Join(OutputPath, "output.yaml")
 	DepsOutputMountPath       = path.Join(OutputPath, "dependencies.yaml")
 	ProviderSettingsMountPath = path.Join(ConfigMountPath, "settings.json")
+	// escaped name for input path to identify output files
+	InputApplicationName      = ""
 )
 
 // kantra analyze flags
@@ -133,6 +135,11 @@ func NewAnalyzeCmd(log logr.Logger) *cobra.Command {
 				log.Error(err, "failed to create json output file")
 				return err
 			}
+			err = analyzeCmd.CopyResultsBulk()
+			if err != nil {
+				log.Error(err, "failed to copy results")
+				return err
+			}
 			err = analyzeCmd.GenerateStaticReport(cmd.Context())
 			if err != nil {
 				log.Error(err, "failed to generate static report")
@@ -189,6 +196,7 @@ func (a *analyzeCommand) Validate() error {
 			}
 		}
 	}
+	InputApplicationName = filepath.Base(a.input)	// TODO probably something better to have safe encoded file/dir name, but still readable for human
 	err := a.CheckOverwriteOutput()
 	if err != nil {
 		return err
@@ -242,6 +250,7 @@ func (a *analyzeCommand) Validate() error {
 	if !a.enableDefaultRulesets && len(a.rules) == 0 {
 		return fmt.Errorf("must specify rules if default rulesets are not enabled")
 	}
+	// TODO: Create a lock file to avoid unwanted paralel execution producing unexpected results?
 	return nil
 }
 
@@ -254,8 +263,9 @@ func (a *analyzeCommand) CheckOverwriteOutput() error {
 		}
 	}
 	if !a.overwrite && stat != nil {
-		return fmt.Errorf("output dir %v already exists and --overwrite not set", a.output)
+		a.log.V(1).Info("output dir %v already exists and --overwrite not set, appending analysis results to existing directory", a.output)
 	}
+	// Just check result files with the input name suffix and stop if not overwrite wanted
 	if a.overwrite && stat != nil {
 		err := os.RemoveAll(a.output)
 		if err != nil {
@@ -764,6 +774,26 @@ func (a *analyzeCommand) RunAnalysis(ctx context.Context, xmlOutputDir string) e
 	return nil
 }
 
+func (a *analyzeCommand) CopyResultsBulk() error {
+	outputPath := filepath.Join(a.output, "output.yaml")
+	analysisLogFilePath := filepath.Join(a.output, "analysis.log")	// Unify with RunAnalysis code, likely export to package level
+	//depPath := filepath.Join(a.output, "dependencies.yaml")
+	err := copyFileContents(outputPath, fmt.Sprintf("%s.%s", outputPath, InputApplicationName))
+	if err != nil {
+		return err
+	}
+	err = copyFileContents(analysisLogFilePath, fmt.Sprintf("%s.%s", analysisLogFilePath, InputApplicationName))
+	if err != nil {
+		return err
+	}
+	//err = copyFileContents(depPath, fmt.Sprintf("%s.%s", depPath, a.input))
+	//if err != nil {
+	//	return err
+	//}
+
+	return nil
+}
+
 func (a *analyzeCommand) CreateJSONOutput() error {
 	if !a.jsonOutput {
 		return nil
@@ -826,11 +856,21 @@ func (a *analyzeCommand) GenerateStaticReport(ctx context.Context) error {
 		a.input:  SourceMountPath,
 		a.output: OutputPath,
 	}
+	var applicationNames, outputAnalyses []string
+	outputAnalyses, err := filepath.Glob(fmt.Sprintf("%s/output.yaml.*", a.output))
+	if err != nil {
+		return err
+	}
+	for i := range outputAnalyses {
+		outputName := filepath.Base(outputAnalyses[i])
+		applicationNames = append(applicationNames, strings.SplitN(outputName, "output.yaml.", 2)[1])
+		outputAnalyses[i] = strings.ReplaceAll(outputAnalyses[i], a.output, OutputPath)	// re-map paths to container mounts
+	}
 	args := []string{}
 	staticReportArgs := []string{"/usr/local/bin/js-bundle-generator",
-		fmt.Sprintf("--analysis-output-list=%s", AnalysisOutputMountPath),
 		fmt.Sprintf("--output-path=%s", path.Join("/usr/local/static-report/output.js")),
-		fmt.Sprintf("--application-name-list=%s", filepath.Base(a.input)),
+		fmt.Sprintf("--analysis-output-list=%s", strings.Join(outputAnalyses, ",")),
+		fmt.Sprintf("--application-name-list=%s", strings.Join(applicationNames, ",")),
 	}
 	if a.mode == string(provider.FullAnalysisMode) {
 		staticReportArgs = append(staticReportArgs,
@@ -848,7 +888,7 @@ func (a *analyzeCommand) GenerateStaticReport(ctx context.Context) error {
 	c := container.NewContainer()
 	a.log.Info("generating static report",
 		"output", a.output, "args", strings.Join(staticReportCmd, " "))
-	err := c.Run(
+	err = c.Run(
 		ctx,
 		container.WithImage(Settings.RunnerImage),
 		container.WithLog(a.log.V(1)),
